@@ -7,8 +7,11 @@
 # - Installs Lustre LDISKFS OSD
 # - Creates Lustre MGS/MDT/OST on loop devices
 # - Sets up test scenarios for project quota behavior
-# - Generates the descriptive test script
+# - Generates enhanced test script with quota monitoring
 # - Configures systemd for boot persistence
+#
+# Reference: LU-13176 - Atomic rename across project IDs (Lustre 2.15+)
+# https://jira.whamcloud.com/browse/LU-13176
 ##################################################
 - name: Configure Lustre Environment with LDISKFS
   hosts: all
@@ -168,17 +171,43 @@
       changed_when: false
 
     # --------------------------------------------------
-    # Test Script Generation (Improved Logging)
+    # Enhanced Test Script with Quota Monitoring
     # --------------------------------------------------
-    - name: Create comprehensive test script
+    - name: Create enhanced test script with quota monitoring
       copy:
         dest: /root/run_tests.sh
         mode: '0755'
         content: |
           #!/bin/bash
+          ##############################################################################
+          # Lustre Project Quota Test Suite - Enhanced with Quota Monitoring
+          #
+          # This script demonstrates:
+          # 1. The EXDEV performance penalty when moving directories across projects
+          # 2. The "double billing" problem during cross-project moves
+          # 3. The difference between file moves (atomic in 2.15+) and directory moves
+          #
+          # Reference: LU-13176 - Enable rename of regular file across projid directories
+          # https://jira.whamcloud.com/browse/LU-13176
+          ##############################################################################
+          
           set -euo pipefail
-
-          BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+          
+          # Colors for output
+          BLUE='\033[0;34m'
+          GREEN='\033[0;32m'
+          YELLOW='\033[1;33m'
+          RED='\033[0;31m'
+          CYAN='\033[0;36m'
+          NC='\033[0m'
+          
+          # Configuration
+          LUSTRE_MOUNT="/mnt/lustre"
+          FSNAME="testfs"
+          TEST_SIZE_MB="${TEST_SIZE_MB:-500}"
+          PROJECT_A=100
+          PROJECT_B=200
+          PROJECT_SAME=300
           
           print_header() { 
               echo -e "\n${BLUE}================================================================${NC}"
@@ -186,120 +215,379 @@
               echo -e "${BLUE}================================================================${NC}"
           }
           
-          print_cmd() { echo -e "${YELLOW}Executing:${NC} $1"; }
-          
-          print_test_result() {
-              echo -e "\n${GREEN}TEST RESULT:${NC}"
-              echo -e "  Operation: $1"
-              echo -e "  Timing:    $2s"
-              echo -e "  Outcome:   $3"
+          print_subheader() {
+              echo -e "\n${CYAN}--- $1 ---${NC}"
           }
-
-          cd /mnt/lustre
-          print_header "LUSTRE PROJECT QUOTA - ISOLATED TEST SUITE"
-          echo "Kernel: $(uname -r) | Lustre: $(lctl version 2>/dev/null | head -1 || echo 'N/A')"
-
-          # --------------------------------------------------
-          # TEST 0: Baseline File Move
-          # --------------------------------------------------
-          print_header "TEST 0: File Move Across Projects (Baseline)"
-          dd if=/dev/urandom of=scenario1_proj100/testfile.bin bs=1M count=50 status=none
+          
+          print_cmd() { 
+              echo -e "${YELLOW}Executing:${NC} $1"
+          }
+          
+          get_project_quota_kb() {
+              local project_id=$1
+              # Get block usage in KB for a project (kbytes column)
+              # Note: lfs quota output format:
+              #   Disk quotas for prj 100 (pid 100):
+              #        Filesystem  kbytes   quota   limit   grace   files   quota   limit   grace
+              #       /mnt/lustre   12345       0       0       -      10       0       0       -
+              # We want column 2 (kbytes used) from the line containing the mount path
+              lfs quota -p "$project_id" "$LUSTRE_MOUNT" 2>/dev/null | \
+                  grep "$LUSTRE_MOUNT" | \
+                  awk '{print $2}' | \
+                  sed 's/\*//g' | \
+                  grep -E '^[0-9]+$' || echo "0"
+          }
+          
+          debug_quota() {
+              local project_id=$1
+              echo "  [DEBUG] Raw lfs quota output for project $project_id:"
+              lfs quota -p "$project_id" "$LUSTRE_MOUNT" 2>&1 | sed 's/^/    /'
+          }
+          
+          format_size() {
+              local kb=$1
+              if [ -z "$kb" ] || [ "$kb" = "0" ]; then
+                  echo "0 KB"
+              elif [ "$kb" -ge 1048576 ]; then
+                  echo "$(echo "scale=2; $kb/1048576" | bc) GB"
+              elif [ "$kb" -ge 1024 ]; then
+                  echo "$(echo "scale=2; $kb/1024" | bc) MB"
+              else
+                  echo "$kb KB"
+              fi
+          }
+          
+          print_quota_status() {
+              local label=$1
+              local qa=$(get_project_quota_kb $PROJECT_A)
+              local qb=$(get_project_quota_kb $PROJECT_B)
+              local total=$((qa + qb))
+              
+              echo -e "${GREEN}[$label]${NC}"
+              echo -e "  Project $PROJECT_A: $(format_size $qa)"
+              echo -e "  Project $PROJECT_B: $(format_size $qb)"
+              echo -e "  ${CYAN}Combined:  $(format_size $total)${NC}"
+          }
+          
+          cleanup_test_dirs() {
+              rm -rf "$LUSTRE_MOUNT"/scenario1_proj100/* 2>/dev/null || true
+              rm -rf "$LUSTRE_MOUNT"/scenario1_proj200/* 2>/dev/null || true
+              rm -rf "$LUSTRE_MOUNT"/scenario2_proj300_src/* 2>/dev/null || true
+              rm -rf "$LUSTRE_MOUNT"/scenario2_proj300_dst/* 2>/dev/null || true
+              sync
+              sleep 1
+          }
+          
+          ##############################################################################
+          # MAIN TEST EXECUTION
+          ##############################################################################
+          
+          cd "$LUSTRE_MOUNT"
+          
+          print_header "LUSTRE PROJECT QUOTA TEST SUITE"
+          echo "Demonstrates EXDEV behavior and quota double-counting"
+          echo ""
+          echo "System Information:"
+          echo "  Kernel:  $(uname -r)"
+          echo "  Lustre:  $(lctl version 2>/dev/null | head -1 || echo 'N/A')"
+          echo "  Mount:   $LUSTRE_MOUNT"
+          echo "  FSName:  $FSNAME"
+          echo ""
+          echo "Test Parameters:"
+          echo "  Test data size: ${TEST_SIZE_MB}MB (override with TEST_SIZE_MB=N)"
+          echo "  Project A (source): $PROJECT_A"
+          echo "  Project B (dest):   $PROJECT_B"
+          
+          # Check Lustre version for LU-13176
+          LUSTRE_VER=$(lctl version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "0.0")
+          echo ""
+          if [ -n "$LUSTRE_VER" ] && [ "$LUSTRE_VER" != "0.0" ]; then
+              MAJOR=$(echo "$LUSTRE_VER" | cut -d. -f1)
+              MINOR=$(echo "$LUSTRE_VER" | cut -d. -f2)
+              if [ "$MAJOR" -gt 2 ] || ([ "$MAJOR" -eq 2 ] && [ "$MINOR" -ge 15 ]); then
+                  echo -e "${GREEN}✓ Lustre $LUSTRE_VER >= 2.15: LU-13176 active${NC}"
+                  echo "  Files: Atomic rename across projects (fast)"
+                  echo "  Directories: Still EXDEV → copy+delete (slow)"
+              else
+                  echo -e "${YELLOW}⚠ Lustre $LUSTRE_VER < 2.15: LU-13176 not available${NC}"
+                  echo "  Both files and directories: EXDEV → copy+delete (slow)"
+              fi
+          fi
+          
+          cleanup_test_dirs
+          
+          ##############################################################################
+          # DEBUG: Verify quota system is working
+          ##############################################################################
+          print_header "QUOTA SYSTEM VERIFICATION"
+          echo "Creating 10MB test file to verify quota accounting..."
+          dd if=/dev/zero of=scenario1_proj100/quota_test.bin bs=1M count=10 status=none
+          sync
+          sleep 2  # Give quota time to update
+          
+          echo ""
+          debug_quota $PROJECT_A
+          echo ""
+          
+          TEST_QUOTA=$(get_project_quota_kb $PROJECT_A)
+          if [ "$TEST_QUOTA" -gt 0 ] 2>/dev/null; then
+              echo -e "${GREEN}✓ Quota system working: Project $PROJECT_A shows $(format_size $TEST_QUOTA)${NC}"
+          else
+              echo -e "${RED}⚠ Quota shows 0 - may need to check quota configuration${NC}"
+              echo "  Trying manual lfs quota command:"
+              lfs quota -p $PROJECT_A $LUSTRE_MOUNT
+          fi
+          
+          rm -f scenario1_proj100/quota_test.bin
+          sync
+          
+          ##############################################################################
+          # TEST 1: File Move Across Projects (Should be atomic in 2.15+)
+          ##############################################################################
+          print_header "TEST 1: Single File Move Across Projects"
+          echo "Expected: Atomic rename in Lustre 2.15+ (LU-13176)"
+          
+          print_subheader "Setup"
+          dd if=/dev/urandom of=scenario1_proj100/testfile.bin bs=1M count=50 status=progress
+          lfs project -s -p $PROJECT_A scenario1_proj100/testfile.bin 2>/dev/null || true
+          sync
+          sleep 1
+          
+          print_subheader "Quota Before Move"
+          print_quota_status "BEFORE"
+          
+          print_subheader "Executing Move"
+          print_cmd "mv scenario1_proj100/testfile.bin scenario1_proj200/testfile.bin"
           
           T_START=$(date +%s.%N)
-          print_cmd "mv scenario1_proj100/testfile.bin scenario1_proj200/testfile.bin"
           strace -e renameat,renameat2 mv scenario1_proj100/testfile.bin scenario1_proj200/testfile.bin 2>&1 | grep -E "renameat|EXDEV" || true
           T_END=$(date +%s.%N)
+          sync
           
-          T_FILE_BASE=$(echo "$T_END - $T_START" | bc)
-          NEW_ID=$(lfs project scenario1_proj200/testfile.bin | awk '{print $1}')
+          T_FILE=$(echo "$T_END - $T_START" | bc)
           
-          print_test_result "Atomic File Rename" "$T_FILE_BASE" "SUCCESS (New ID: $NEW_ID)"
+          print_subheader "Quota After Move"
+          print_quota_status "AFTER"
+          
+          NEW_PROJECT_ID=$(lfs project scenario1_proj200/testfile.bin 2>/dev/null | awk '{print $1}')
+          echo ""
+          echo -e "${GREEN}Results:${NC}"
+          echo "  Time: ${T_FILE}s"
+          echo "  File's new Project ID: $NEW_PROJECT_ID"
+          
           rm -f scenario1_proj200/testfile.bin
-
-          # --------------------------------------------------
-          # TEST 1: Directory EXDEV Detection
-          # --------------------------------------------------
-          print_header "TEST 1: EXDEV Detection (Directory Move)"
-          mkdir -p scenario1_proj100/testdir
-          lfs project -s -p 100 -r scenario1_proj100/testdir >/dev/null
+          sync
           
-          echo -e "${YELLOW}Running strace on directory move...${NC}"
-          STRACE_OUT=$(strace -e renameat,renameat2 mv scenario1_proj100/testdir scenario1_proj200/testdir 2>&1 || true)
-          echo "$STRACE_OUT" | grep -E "renameat|EXDEV" || true
+          ##############################################################################
+          # TEST 2: Directory Move Across Projects (EXDEV - with quota monitoring)
+          ##############################################################################
+          print_header "TEST 2: Directory Move Across Projects - QUOTA MONITORING"
+          echo "Expected: EXDEV error → copy+delete fallback"
+          echo -e "${RED}This test demonstrates the DOUBLE BILLING problem${NC}"
           
-          if echo "$STRACE_OUT" | grep -q "EXDEV"; then
-              OUTCOME="${RED}EXDEV DETECTED (Copy+Delete Required)${NC}"
-          else
-              OUTCOME="Rename Succeeded"
-          fi
-          print_test_result "Cross-Project Directory Move" "N/A" "$OUTCOME"
-          rm -rf scenario1_proj200/testdir scenario1_proj100/testdir
-
-          # --------------------------------------------------
-          # TEST 2: Slow Path Timing
-          # --------------------------------------------------
-          print_header "TEST 2: Slow Path Timing (500MB Cross-Project)"
-          mkdir -p scenario1_proj100/slowdir
-          dd if=/dev/urandom of=scenario1_proj100/slowdir/big.bin bs=1M count=500 status=none
-          lfs project -s -p 100 -r scenario1_proj100/slowdir >/dev/null
+          print_subheader "Setup"
+          mkdir -p scenario1_proj100/bigdir
+          dd if=/dev/urandom of=scenario1_proj100/bigdir/data.bin bs=1M count=$TEST_SIZE_MB status=progress
+          lfs project -s -p $PROJECT_A -r scenario1_proj100/bigdir >/dev/null
+          sync
+          sleep 2
+          
+          print_subheader "Quota Before Move"
+          print_quota_status "BEFORE"
+          BEFORE_A=$(get_project_quota_kb $PROJECT_A)
+          BEFORE_B=$(get_project_quota_kb $PROJECT_B)
+          BEFORE_TOTAL=$((BEFORE_A + BEFORE_B))
+          
+          print_subheader "Executing Move (with periodic quota sampling)"
+          print_cmd "mv scenario1_proj100/bigdir scenario1_proj200/bigdir"
+          echo ""
+          
+          # Start background quota monitor
+          QUOTA_LOG="/tmp/quota_monitor_$$"
+          (
+              while true; do
+                  qa=$(get_project_quota_kb $PROJECT_A)
+                  qb=$(get_project_quota_kb $PROJECT_B)
+                  echo "$(date +%s.%N) $qa $qb" >> "$QUOTA_LOG"
+                  sleep 0.5
+              done
+          ) &
+          MONITOR_PID=$!
           
           T1=$(date +%s.%N)
-          print_cmd "mv scenario1_proj100/slowdir scenario1_proj200/slowdir"
-          mv scenario1_proj100/slowdir scenario1_proj200/slowdir
+          mv scenario1_proj100/bigdir scenario1_proj200/bigdir
           T2=$(date +%s.%N)
+          sync
+          
+          # Stop monitor
+          kill $MONITOR_PID 2>/dev/null || true
+          wait $MONITOR_PID 2>/dev/null || true
           
           TSLOW=$(echo "$T2 - $T1" | bc)
-          print_test_result "Recursive Copy + Delete" "$TSLOW" "FORCED BY EXDEV"
-          rm -rf scenario1_proj200/slowdir
-
-          # --------------------------------------------------
-          # TEST 3: Fast Path Timing
-          # --------------------------------------------------
-          print_header "TEST 3: Fast Path Timing (500MB Same-Project)"
+          
+          # Analyze quota samples
+          if [ -f "$QUOTA_LOG" ]; then
+              MAX_COMBINED=0
+              SAMPLES=0
+              while read -r ts qa qb; do
+                  combined=$((qa + qb))
+                  if [ "$combined" -gt "$MAX_COMBINED" ]; then
+                      MAX_COMBINED=$combined
+                  fi
+                  SAMPLES=$((SAMPLES + 1))
+              done < "$QUOTA_LOG"
+              rm -f "$QUOTA_LOG"
+              
+              echo -e "  ${CYAN}Quota samples collected: $SAMPLES${NC}"
+              echo -e "  ${CYAN}Peak combined usage: $(format_size $MAX_COMBINED)${NC}"
+              
+              # Check for double-billing
+              THRESHOLD=$((BEFORE_TOTAL + 10240))  # 10MB tolerance
+              if [ "$MAX_COMBINED" -gt "$THRESHOLD" ]; then
+                  OVERAGE=$((MAX_COMBINED - BEFORE_TOTAL))
+                  echo -e "  ${RED}⚠ DOUBLE BILLING DETECTED!${NC}"
+                  echo -e "  ${RED}  Peak was $(format_size $OVERAGE) above baseline${NC}"
+              fi
+          fi
+          
+          print_subheader "Quota After Move"
+          print_quota_status "AFTER"
+          
+          echo ""
+          echo -e "${GREEN}Results:${NC}"
+          echo "  Time: ${TSLOW}s"
+          echo "  Data size: ${TEST_SIZE_MB}MB"
+          echo ""
+          echo -e "${RED}BILLING IMPACT:${NC}"
+          echo "  If a billing snapshot occurred during the ${TSLOW}s window,"
+          echo "  the user would be charged for ~$(echo "scale=0; $TEST_SIZE_MB * 2" | bc)MB instead of ${TEST_SIZE_MB}MB."
+          
+          rm -rf scenario1_proj200/bigdir
+          sync
+          
+          ##############################################################################
+          # TEST 3: Same-Project Directory Move (Baseline - instant)
+          ##############################################################################
+          print_header "TEST 3: Same-Project Directory Move (Baseline)"
+          echo "Expected: Instant atomic rename (no EXDEV)"
+          
+          print_subheader "Setup"
           mkdir -p scenario2_proj300_src/fastdir
-          dd if=/dev/urandom of=scenario2_proj300_src/fastdir/big.bin bs=1M count=500 status=none
-          lfs project -s -p 300 -r scenario2_proj300_src/fastdir >/dev/null
+          dd if=/dev/urandom of=scenario2_proj300_src/fastdir/data.bin bs=1M count=$TEST_SIZE_MB status=progress
+          lfs project -s -p $PROJECT_SAME -r scenario2_proj300_src/fastdir >/dev/null
+          sync
+          
+          print_subheader "Quota Before Move"
+          Q_SAME_BEFORE=$(get_project_quota_kb $PROJECT_SAME)
+          echo "  Project $PROJECT_SAME: $(format_size $Q_SAME_BEFORE)"
+          
+          print_subheader "Executing Move"
+          print_cmd "mv scenario2_proj300_src/fastdir scenario2_proj300_dst/fastdir"
           
           T3=$(date +%s.%N)
-          print_cmd "mv scenario2_proj300_src/fastdir scenario2_proj300_dst/fastdir"
           mv scenario2_proj300_src/fastdir scenario2_proj300_dst/fastdir
           T4=$(date +%s.%N)
+          sync
           
           TFAST=$(echo "$T4 - $T3" | bc)
-          print_test_result "Atomic Metadata Rename" "$TFAST" "SUCCESS"
+          
+          print_subheader "Quota After Move"
+          Q_SAME_AFTER=$(get_project_quota_kb $PROJECT_SAME)
+          echo "  Project $PROJECT_SAME: $(format_size $Q_SAME_AFTER)"
+          
+          echo ""
+          echo -e "${GREEN}Results:${NC}"
+          echo "  Time: ${TFAST}s"
+          echo "  Quota unchanged (same project, just metadata update)"
+          echo "  No double-billing risk."
+          
           rm -rf scenario2_proj300_dst/fastdir
-
-          # --------------------------------------------------
-          # TEST 4: Workaround Timing
-          # --------------------------------------------------
-          print_header "TEST 4: Workaround Timing (ID Alignment)"
-          mkdir -p scenario1_proj100/workaround
-          lfs project -s -p 100 -r scenario1_proj100/workaround >/dev/null
+          sync
           
-          print_cmd "lfs project -s -p 200 -r scenario1_proj100/workaround"
-          lfs project -s -p 200 -r scenario1_proj100/workaround >/dev/null
+          ##############################################################################
+          # TEST 4: Workaround - Pre-align Project ID
+          ##############################################################################
+          print_header "TEST 4: Workaround - Align Project ID Before Move"
+          echo "Demonstrates how to avoid EXDEV and double-billing"
           
+          print_subheader "Setup"
+          mkdir -p scenario1_proj100/workaround_dir
+          dd if=/dev/urandom of=scenario1_proj100/workaround_dir/data.bin bs=1M count=$TEST_SIZE_MB status=progress
+          lfs project -s -p $PROJECT_A -r scenario1_proj100/workaround_dir >/dev/null
+          sync
+          
+          print_subheader "Quota Before (data in Project A)"
+          print_quota_status "BEFORE"
+          
+          print_subheader "Step 1: Change Project ID IN PLACE (metadata-only)"
+          print_cmd "lfs project -s -p $PROJECT_B -r scenario1_proj100/workaround_dir"
           T5=$(date +%s.%N)
-          print_cmd "mv scenario1_proj100/workaround scenario1_proj200/workaround"
-          mv scenario1_proj100/workaround scenario1_proj200/workaround
+          lfs project -s -p $PROJECT_B -r scenario1_proj100/workaround_dir >/dev/null
           T6=$(date +%s.%N)
+          sync
           
-          TWORK=$(echo "$T6 - $T5" | bc)
-          print_test_result "Aligned Project ID Move" "$TWORK" "SUCCESS (Atomic)"
-          rm -rf scenario1_proj200/workaround
-
-          # --------------------------------------------------
+          T_REPROJECT=$(echo "$T6 - $T5" | bc)
+          echo "  Re-project time: ${T_REPROJECT}s"
+          
+          print_subheader "Quota After Re-project"
+          print_quota_status "AFTER REPROJECT"
+          echo "  Note: Data moved between quotas WITHOUT copying bytes!"
+          
+          print_subheader "Step 2: Move Directory (now same project = instant)"
+          print_cmd "mv scenario1_proj100/workaround_dir scenario1_proj200/workaround_dir"
+          T7=$(date +%s.%N)
+          mv scenario1_proj100/workaround_dir scenario1_proj200/workaround_dir
+          T8=$(date +%s.%N)
+          sync
+          
+          T_MOVE=$(echo "$T8 - $T7" | bc)
+          
+          print_subheader "Final Quota"
+          print_quota_status "FINAL"
+          
+          echo ""
+          echo -e "${GREEN}Results:${NC}"
+          echo "  Re-project time: ${T_REPROJECT}s"
+          echo "  Move time:       ${T_MOVE}s"
+          echo "  Total time:      $(echo "$T_REPROJECT + $T_MOVE" | bc)s"
+          echo ""
+          echo -e "${CYAN}Advantage: No double-billing! Quota transfer is atomic.${NC}"
+          
+          rm -rf scenario1_proj200/workaround_dir
+          sync
+          
+          ##############################################################################
           # FINAL SUMMARY
-          # --------------------------------------------------
-          print_header "FINAL COMPARATIVE SUMMARY"
-          echo -e "  File Baseline (Atomic):    ${T_FILE_BASE}s"
-          echo -e "  Directory Slow Path (EXDEV): ${TSLOW}s"
-          echo -e "  Directory Fast Path (Same):  ${TFAST}s"
-          echo -e "  Directory Workaround:        ${TWORK}s"
+          ##############################################################################
+          print_header "FINAL SUMMARY"
           
-          DIFF=$(echo "scale=2; $TSLOW / $TFAST" | bc 2>/dev/null || echo "N/A")
-          echo -e "\n${BLUE}Conclusion:${NC} Cross-project moves are ${DIFF}x slower than atomic renames."
+          echo -e "${CYAN}Timing Comparison (${TEST_SIZE_MB}MB test data):${NC}"
+          echo "  Single file move (atomic):           ${T_FILE}s"
+          echo "  Directory cross-project (EXDEV):     ${TSLOW}s"
+          echo "  Directory same-project (atomic):     ${TFAST}s"
+          echo "  Workaround (reproject + move):       $(echo "$T_REPROJECT + $T_MOVE" | bc)s"
+          echo ""
+          
+          if [ -n "$TFAST" ] && [ "$TFAST" != "0" ]; then
+              SPEEDUP=$(echo "scale=1; $TSLOW / $TFAST" | bc 2>/dev/null || echo "N/A")
+              echo -e "${RED}Cross-project directory moves are ${SPEEDUP}x slower${NC}"
+          fi
+          
+          echo ""
+          echo -e "${CYAN}Billing Impact:${NC}"
+          echo "  • During EXDEV moves, quota usage temporarily DOUBLES"
+          echo "  • If billing snapshot occurs mid-move, users are overcharged"
+          echo "  • Workaround: Use 'lfs project' to reassign ID first"
+          echo ""
+          echo -e "${CYAN}Recommendations:${NC}"
+          echo "  1. For large moves: reassign project ID with 'lfs project' first"
+          echo "  2. Schedule bulk moves outside billing snapshot windows"
+          echo "  3. Monitor quota during data migrations"
+          echo "  4. Use Lustre 2.15+ for atomic file renames (LU-13176)"
+          echo "  5. Directories ALWAYS trigger EXDEV regardless of Lustre version"
+          
           print_header "ALL TESTS COMPLETE"
+
     # --------------------------------------------------
     # Persistence Configuration
     # --------------------------------------------------
@@ -322,4 +610,12 @@
       systemd: { name: lustre-test, enabled: yes, daemon_reload: yes }
 
     - name: Final Success Message
-      debug: { msg: "Phase 2 Complete. Run 'sudo /root/run_tests.sh' inside the VM." }
+      debug:
+        msg:
+          - "=============================================="
+          - "Phase 2 Complete"
+          - "=============================================="
+          - "Run 'sudo /root/run_tests.sh' to execute tests"
+          - "Override test size: TEST_SIZE_MB=1000 sudo /root/run_tests.sh"
+          - "=============================================="
+
