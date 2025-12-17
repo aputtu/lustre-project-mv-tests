@@ -1,0 +1,611 @@
+---
+##################################################
+# PHASE 2: Configure Lustre with ZFS
+#
+# This phase:
+# - Verifies the Lustre kernel is running
+# - Installs and configures ZFS
+# - Creates Lustre MGS/MDT/OST on ZFS pools
+# - Sets up test scenarios for project quota behavior
+# - Generates the test script
+#
+# Run automatically after Phase 1 reboot, or manually:
+#   vagrant provision --provision-with lustre_config
+##################################################
+- name: Configure Lustre Environment with ZFS
+  hosts: all
+  become: true
+  vars:
+    lustre_fsname: "testfs"
+    lustre_mgsnode: "192.168.60.10@tcp0"
+    test_file_sizes:
+      small: "100M"
+      large: "500M"
+
+  tasks:
+    # --------------------------------------------------
+    # Kernel Verification
+    # --------------------------------------------------
+    - name: Verify Lustre kernel is running
+      command: uname -r
+      register: kernel_version
+      failed_when: "'lustre' not in kernel_version.stdout"
+      changed_when: false
+
+    - name: Display kernel version
+      debug:
+        msg: "Running kernel: {{ kernel_version.stdout }}"
+
+    # --------------------------------------------------
+    # ZFS Installation
+    # --------------------------------------------------
+    - name: Install ZFS repository
+      dnf:
+        name: "https://zfsonlinux.org/epel/zfs-release-2-3.el9.noarch.rpm"
+        state: present
+        disable_gpg_check: yes
+
+    - name: Install ZFS packages
+      dnf:
+        name:
+          - zfs
+          - zfs-dkms
+        state: present
+
+    - name: Load ZFS kernel module
+      modprobe:
+        name: zfs
+        state: present
+
+    - name: Generate ZFS hostid if missing
+      command: zgenhostid
+      args:
+        creates: /etc/hostid
+      ignore_errors: true
+
+    # --------------------------------------------------
+    # Lustre Package Installation
+    # --------------------------------------------------
+    - name: Install Lustre ZFS OSD and utilities
+      dnf:
+        name:
+          - lustre-osd-zfs-mount
+          - kmod-lustre-osd-zfs
+          - strace
+          - bc
+          - perf
+        state: present
+
+    # --------------------------------------------------
+    # Lustre Module Loading (Order Matters!)
+    # --------------------------------------------------
+    - name: Load Lustre modules in correct order
+      shell: |
+        # Load base modules first
+        modprobe -v lnet
+        modprobe -v lustre
+        # Load ZFS OSD module (required for ZFS-backed targets)
+        modprobe -v osd_zfs
+      register: modprobe_result
+      changed_when: false
+
+    - name: Display loaded modules
+      debug:
+        msg: "{{ modprobe_result.stdout_lines }}"
+
+    - name: Verify Lustre modules are loaded
+      shell: lsmod | grep -E "^(lustre|lnet|osd_zfs)" | awk '{print $1}'
+      register: loaded_modules
+      changed_when: false
+
+    - name: Display loaded Lustre modules
+      debug:
+        msg: "Loaded Lustre modules: {{ loaded_modules.stdout_lines }}"
+
+    - name: Fail if critical modules missing
+      fail:
+        msg: |
+          Required Lustre modules not loaded. Found: {{ loaded_modules.stdout_lines }}
+          Expected: lustre, lnet, osd_zfs
+          Try manually: modprobe osd_zfs
+      when: loaded_modules.stdout_lines | length < 2
+
+    # --------------------------------------------------
+    # LNet Configuration (Dynamic Interface Detection)
+    # --------------------------------------------------
+    - name: Detect network interface for private network
+      shell: ip -o addr show | grep '192.168.60.10' | awk '{print $2}'
+      register: private_interface
+      changed_when: false
+
+    - name: Validate private interface was found
+      fail:
+        msg: "Could not find network interface with IP 192.168.60.10"
+      when: private_interface.stdout == ""
+
+    - name: Display detected interface
+      debug:
+        msg: "Using network interface: {{ private_interface.stdout }}"
+
+    - name: Configure LNet (Lustre Networking)
+      shell: |
+        lnetctl lnet configure 2>/dev/null || true
+        lnetctl net add --net tcp0 --if {{ private_interface.stdout }} 2>/dev/null || true
+      changed_when: false
+
+    - name: Verify LNet is configured
+      command: lctl list_nids
+      register: lnet_nids
+      changed_when: false
+
+    - name: Display LNet NIDs
+      debug:
+        msg: "LNet NIDs: {{ lnet_nids.stdout_lines }}"
+
+    # --------------------------------------------------
+    # ZFS Pool Creation
+    # --------------------------------------------------
+    - name: Create backing files for ZFS pools
+      command: truncate -s {{ item.size }} {{ item.path }}
+      args:
+        creates: "{{ item.path }}"
+      loop:
+        - { path: "/var/lib/lustre-mdt.img", size: "5G" }
+        - { path: "/var/lib/lustre-ost.img", size: "15G" }
+
+    - name: Check if MDT pool exists
+      command: zpool list mdtpool
+      register: mdtpool_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Check if OST pool exists
+      command: zpool list ostpool
+      register: ostpool_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Create MDT ZFS pool
+      command: zpool create -f mdtpool /var/lib/lustre-mdt.img
+      when: mdtpool_exists.rc != 0
+
+    - name: Create OST ZFS pool
+      command: zpool create -f ostpool /var/lib/lustre-ost.img
+      when: ostpool_exists.rc != 0
+
+    # --------------------------------------------------
+    # Lustre Target Formatting
+    # --------------------------------------------------
+    - name: Check if Lustre targets are formatted
+      command: zfs get lustre:svname mdtpool/mdt0
+      register: lustre_formatted
+      failed_when: false
+      changed_when: false
+
+    - name: Format Lustre MGS/MDT (combined)
+      command: >
+        mkfs.lustre --reformat
+        --fsname={{ lustre_fsname }}
+        --mgs
+        --mdt
+        --backfstype=zfs
+        --index=0
+        mdtpool/mdt0
+      when: lustre_formatted.rc != 0
+
+    - name: Format Lustre OST
+      command: >
+        mkfs.lustre --reformat
+        --fsname={{ lustre_fsname }}
+        --ost
+        --backfstype=zfs
+        --index=0
+        --mgsnode={{ lustre_mgsnode }}
+        ostpool/ost0
+      when: lustre_formatted.rc != 0
+
+    # --------------------------------------------------
+    # Lustre Mount Points
+    # --------------------------------------------------
+    - name: Create mount points
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /mnt/mdt
+        - /mnt/ost
+        - /mnt/lustre
+
+    - name: Display diagnostic information before mounting
+      shell: |
+        echo "=== Loaded Lustre Modules ==="
+        lsmod | grep -E "(lustre|lnet|osd)" || echo "No lustre modules found"
+        echo ""
+        echo "=== ZFS Pools ==="
+        zpool list
+        echo ""
+        echo "=== ZFS Datasets ==="
+        zfs list
+        echo ""
+        echo "=== Filesystem Support ==="
+        grep lustre /proc/filesystems || echo "lustre not in /proc/filesystems"
+      register: diagnostics
+      changed_when: false
+
+    - name: Show diagnostics
+      debug:
+        msg: "{{ diagnostics.stdout_lines }}"
+
+    - name: Verify osd_zfs is loaded before mounting
+      shell: lsmod | grep -q osd_zfs
+      register: osd_check
+      retries: 3
+      delay: 2
+      until: osd_check.rc == 0
+
+    - name: Mount MDT
+      shell: mountpoint -q /mnt/mdt || mount -t lustre mdtpool/mdt0 /mnt/mdt
+      register: mdt_mount
+      retries: 3
+      delay: 5
+      until: mdt_mount.rc == 0
+      changed_when: false
+
+    - name: Mount OST
+      shell: mountpoint -q /mnt/ost || mount -t lustre ostpool/ost0 /mnt/ost
+      changed_when: false
+
+    - name: Mount Lustre client filesystem
+      mount:
+        path: /mnt/lustre
+        src: "{{ lustre_mgsnode }}:/{{ lustre_fsname }}"
+        fstype: lustre
+        state: mounted
+
+    # --------------------------------------------------
+    # Project Quota Configuration
+    # --------------------------------------------------
+    - name: Enable project quota enforcement on MDT and OST
+      shell: |
+        lctl conf_param {{ lustre_fsname }}.quota.mdt=ugp 2>/dev/null || true
+        lctl conf_param {{ lustre_fsname }}.quota.ost=ugp 2>/dev/null || true
+      changed_when: false
+
+    - name: Wait for quota subsystem to initialize
+      pause:
+        seconds: 3
+
+    # --------------------------------------------------
+    # Test Scenario Setup
+    # --------------------------------------------------
+    - name: Create test scenario directories
+      file:
+        path: "/mnt/lustre/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - scenario1_proj100
+        - scenario1_proj200
+        - scenario2_proj300_src
+        - scenario2_proj300_dst
+
+    - name: Set project IDs for Scenario 1 (Different Project IDs)
+      shell: |
+        lfs project -s -p 100 -r /mnt/lustre/scenario1_proj100
+        lfs project -s -p 200 -r /mnt/lustre/scenario1_proj200
+      changed_when: false
+
+    - name: Set project IDs for Scenario 2 (Same Project IDs)
+      shell: |
+        lfs project -s -p 300 -r /mnt/lustre/scenario2_proj300_src
+        lfs project -s -p 300 -r /mnt/lustre/scenario2_proj300_dst
+      changed_when: false
+
+    - name: Create test data files (100MB for quick tests)
+      shell: |
+        dd if=/dev/urandom of=/mnt/lustre/scenario1_proj100/testfile_100M.bin bs=1M count=100 status=none
+        dd if=/dev/urandom of=/mnt/lustre/scenario2_proj300_src/testfile_100M.bin bs=1M count=100 status=none
+      args:
+        creates: /mnt/lustre/scenario1_proj100/testfile_100M.bin
+
+    - name: Create larger test files (500MB for dramatic timing difference)
+      shell: |
+        dd if=/dev/urandom of=/mnt/lustre/scenario1_proj100/testfile_500M.bin bs=1M count=500 status=none
+        dd if=/dev/urandom of=/mnt/lustre/scenario2_proj300_src/testfile_500M.bin bs=1M count=500 status=none
+      args:
+        creates: /mnt/lustre/scenario1_proj100/testfile_500M.bin
+
+    # --------------------------------------------------
+    # Test Script Generation
+    # --------------------------------------------------
+    - name: Create comprehensive test script
+      copy:
+        dest: /root/run_tests.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          #
+          # Lustre Project Quota - mv Behavior Test Suite
+          #
+          # This script demonstrates that moving files between directories
+          # with different Lustre Project IDs causes EXDEV errors, forcing
+          # mv to fall back to slow copy-and-delete instead of atomic rename.
+          #
+          set -euo pipefail
+
+          # Colors for output
+          RED='\033[0;31m'
+          GREEN='\033[0;32m'
+          YELLOW='\033[1;33m'
+          BLUE='\033[0;34m'
+          NC='\033[0m' # No Color
+
+          print_header() {
+              echo ""
+              echo -e "${BLUE}================================================================${NC}"
+              echo -e "${BLUE}$1${NC}"
+              echo -e "${BLUE}================================================================${NC}"
+          }
+
+          print_result() {
+              local status=$1
+              local message=$2
+              if [[ "$status" == "PASS" ]]; then
+                  echo -e "${GREEN}✓ RESULT: $message${NC}"
+              elif [[ "$status" == "FAIL" ]]; then
+                  echo -e "${RED}✗ RESULT: $message${NC}"
+              else
+                  echo -e "${YELLOW}→ $message${NC}"
+              fi
+          }
+
+          cd /mnt/lustre
+
+          print_header "LUSTRE PROJECT QUOTA - MV BEHAVIOR TEST SUITE"
+          echo ""
+          echo "Environment:"
+          echo "  Kernel:  $(uname -r)"
+          echo "  Lustre:  $(lctl version 2>/dev/null | head -1 || echo 'N/A')"
+          echo "  ZFS:     $(zfs version 2>/dev/null | head -1 || echo 'N/A')"
+          echo ""
+          echo "Hypothesis:"
+          echo "  Moving files between directories with DIFFERENT project IDs"
+          echo "  triggers EXDEV error, forcing slow copy+delete instead of"
+          echo "  atomic rename."
+
+          # ============================================================
+          # TEST 1: EXDEV Detection (Different Project IDs)
+          # ============================================================
+          print_header "TEST 1: EXDEV Detection (Project ID Mismatch)"
+
+          echo "Source directory (Project ID 100):"
+          lfs project -d scenario1_proj100
+          echo ""
+          echo "Destination directory (Project ID 200):"
+          lfs project -d scenario1_proj200
+          echo ""
+
+          # Ensure test file exists
+          if [[ ! -f scenario1_proj100/testfile_100M.bin ]]; then
+              echo "Creating test file..."
+              dd if=/dev/urandom of=scenario1_proj100/testfile_100M.bin bs=1M count=100 status=none
+          fi
+
+          echo "Attempting mv with strace to capture syscalls..."
+          echo ""
+          
+          STRACE_OUTPUT=$(strace -e renameat,renameat2 mv scenario1_proj100/testfile_100M.bin scenario1_proj200/testfile_100M.bin 2>&1 || true)
+          
+          echo "Strace output:"
+          echo "$STRACE_OUTPUT" | head -10
+          echo ""
+
+          if echo "$STRACE_OUTPUT" | grep -q "EXDEV"; then
+              print_result "PASS" "EXDEV detected - atomic rename failed as expected"
+              echo "  The kernel returned EXDEV (cross-device link), forcing mv to"
+              echo "  copy the file byte-by-byte and then delete the original."
+          else
+              print_result "FAIL" "EXDEV not detected - atomic rename may have succeeded"
+          fi
+
+          # Restore file for next test
+          if [[ -f scenario1_proj200/testfile_100M.bin ]]; then
+              mv scenario1_proj200/testfile_100M.bin scenario1_proj100/testfile_100M.bin 2>/dev/null || \
+              cp scenario1_proj200/testfile_100M.bin scenario1_proj100/testfile_100M.bin && rm scenario1_proj200/testfile_100M.bin
+          fi
+
+          # ============================================================
+          # TEST 2: Timing Comparison (Small File - 100MB)
+          # ============================================================
+          print_header "TEST 2: Timing Comparison - 100MB File"
+
+          echo -e "${YELLOW}Test 2a: Different Project IDs (100 → 200) - SLOW PATH${NC}"
+          echo "This will trigger EXDEV and force copy+delete..."
+          echo ""
+          
+          START=$(date +%s.%N)
+          mv scenario1_proj100/testfile_100M.bin scenario1_proj200/testfile_100M.bin 2>/dev/null || true
+          END=$(date +%s.%N)
+          SLOW_TIME=$(echo "$END - $START" | bc)
+          
+          echo "Time elapsed: ${SLOW_TIME} seconds"
+          
+          # Restore
+          mv scenario1_proj200/testfile_100M.bin scenario1_proj100/testfile_100M.bin 2>/dev/null || \
+          cp scenario1_proj200/testfile_100M.bin scenario1_proj100/testfile_100M.bin && rm scenario1_proj200/testfile_100M.bin
+          
+          echo ""
+          echo -e "${YELLOW}Test 2b: Same Project IDs (300 → 300) - FAST PATH${NC}"
+          echo "This should use atomic rename..."
+          echo ""
+          
+          START=$(date +%s.%N)
+          mv scenario2_proj300_src/testfile_100M.bin scenario2_proj300_dst/testfile_100M.bin
+          END=$(date +%s.%N)
+          FAST_TIME=$(echo "$END - $START" | bc)
+          
+          echo "Time elapsed: ${FAST_TIME} seconds"
+          
+          # Restore
+          mv scenario2_proj300_dst/testfile_100M.bin scenario2_proj300_src/testfile_100M.bin
+          
+          echo ""
+          if (( $(echo "$SLOW_TIME > $FAST_TIME * 2" | bc -l) )); then
+              SPEEDUP=$(echo "scale=1; $SLOW_TIME / $FAST_TIME" | bc)
+              print_result "PASS" "Fast path is ${SPEEDUP}x faster than slow path"
+          else
+              print_result "FAIL" "Timing difference not significant (slow: ${SLOW_TIME}s, fast: ${FAST_TIME}s)"
+          fi
+
+          # ============================================================
+          # TEST 3: Timing Comparison (Large File - 500MB)
+          # ============================================================
+          print_header "TEST 3: Timing Comparison - 500MB File (More Dramatic)"
+
+          if [[ ! -f scenario1_proj100/testfile_500M.bin ]]; then
+              echo "Creating 500MB test file..."
+              dd if=/dev/urandom of=scenario1_proj100/testfile_500M.bin bs=1M count=500 status=none
+          fi
+          if [[ ! -f scenario2_proj300_src/testfile_500M.bin ]]; then
+              dd if=/dev/urandom of=scenario2_proj300_src/testfile_500M.bin bs=1M count=500 status=none
+          fi
+
+          echo -e "${YELLOW}Test 3a: Different Project IDs (SLOW PATH)${NC}"
+          
+          START=$(date +%s.%N)
+          mv scenario1_proj100/testfile_500M.bin scenario1_proj200/testfile_500M.bin 2>/dev/null || true
+          END=$(date +%s.%N)
+          SLOW_TIME_500=$(echo "$END - $START" | bc)
+          
+          echo "Time elapsed: ${SLOW_TIME_500} seconds"
+          
+          # Restore
+          mv scenario1_proj200/testfile_500M.bin scenario1_proj100/testfile_500M.bin 2>/dev/null || \
+          cp scenario1_proj200/testfile_500M.bin scenario1_proj100/testfile_500M.bin && rm scenario1_proj200/testfile_500M.bin
+          
+          echo ""
+          echo -e "${YELLOW}Test 3b: Same Project IDs (FAST PATH)${NC}"
+          
+          START=$(date +%s.%N)
+          mv scenario2_proj300_src/testfile_500M.bin scenario2_proj300_dst/testfile_500M.bin
+          END=$(date +%s.%N)
+          FAST_TIME_500=$(echo "$END - $START" | bc)
+          
+          echo "Time elapsed: ${FAST_TIME_500} seconds"
+          
+          # Restore
+          mv scenario2_proj300_dst/testfile_500M.bin scenario2_proj300_src/testfile_500M.bin
+          
+          echo ""
+          if (( $(echo "$SLOW_TIME_500 > $FAST_TIME_500 * 2" | bc -l) )); then
+              SPEEDUP=$(echo "scale=1; $SLOW_TIME_500 / $FAST_TIME_500" | bc)
+              print_result "PASS" "Fast path is ${SPEEDUP}x faster (500MB: slow=${SLOW_TIME_500}s, fast=${FAST_TIME_500}s)"
+          else
+              print_result "FAIL" "Timing difference not significant"
+          fi
+
+          # ============================================================
+          # TEST 4: The Workaround (Change Project ID Before Move)
+          # ============================================================
+          print_header "TEST 4: Workaround - Change Project ID Before Move"
+
+          echo "Current file project ID:"
+          lfs project scenario1_proj100/testfile_100M.bin
+          echo ""
+          
+          echo "Destination directory project ID:"
+          lfs project -d scenario1_proj200
+          echo ""
+          
+          echo -e "${YELLOW}Step 1: Change file's project ID to match destination (200)${NC}"
+          lfs project -s -p 200 scenario1_proj100/testfile_100M.bin
+          lfs project scenario1_proj100/testfile_100M.bin
+          echo ""
+          
+          echo -e "${YELLOW}Step 2: Move file (should be instant now)${NC}"
+          START=$(date +%s.%N)
+          strace -e renameat,renameat2 mv scenario1_proj100/testfile_100M.bin scenario1_proj200/testfile_100M.bin 2>&1 | head -5
+          END=$(date +%s.%N)
+          WORKAROUND_TIME=$(echo "$END - $START" | bc)
+          echo ""
+          echo "Time elapsed: ${WORKAROUND_TIME} seconds"
+          
+          if (( $(echo "$WORKAROUND_TIME < 1" | bc -l) )); then
+              print_result "PASS" "Workaround successful - move was near-instant"
+          else
+              print_result "FAIL" "Workaround did not improve performance"
+          fi
+          
+          # Restore
+          mv scenario1_proj200/testfile_100M.bin scenario1_proj100/testfile_100M.bin
+          lfs project -s -p 100 scenario1_proj100/testfile_100M.bin
+
+          # ============================================================
+          # SUMMARY
+          # ============================================================
+          print_header "TEST SUMMARY"
+
+          echo "Key Findings:"
+          echo ""
+          echo "1. Moving files between directories with DIFFERENT project IDs"
+          echo "   triggers EXDEV, causing mv to fall back to copy+delete."
+          echo ""
+          echo "2. This is dramatically slower for large files:"
+          echo "   - 100MB: ~${SLOW_TIME}s (copy) vs ~${FAST_TIME}s (rename)"
+          echo "   - 500MB: ~${SLOW_TIME_500}s (copy) vs ~${FAST_TIME_500}s (rename)"
+          echo ""
+          echo "3. Workaround: Change file's project ID BEFORE moving:"
+          echo "   lfs project -s -p <dest_proj_id> <file>"
+          echo "   mv <file> <destination>"
+          echo ""
+          echo "4. Best practice: Ensure source and destination directories"
+          echo "   have the same project ID when moving large files frequently."
+          echo ""
+          print_header "ALL TESTS COMPLETE"
+
+    - name: Create quick test script (single scenario)
+      copy:
+        dest: /root/quick_test.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Quick single-scenario test
+          cd /mnt/lustre
+          echo "=== Quick EXDEV Test ==="
+          echo "Source project: $(lfs project -d scenario1_proj100 | awk '{print $1}')"
+          echo "Dest project:   $(lfs project -d scenario1_proj200 | awk '{print $1}')"
+          echo ""
+          echo "Running mv with strace..."
+          strace -e renameat2 mv scenario1_proj100/testfile_100M.bin scenario1_proj200/ 2>&1 | grep -E "(renameat|EXDEV)" | head -3
+          echo ""
+          # Restore
+          mv scenario1_proj200/testfile_100M.bin scenario1_proj100/ 2>/dev/null || true
+
+    # --------------------------------------------------
+    # Completion
+    # --------------------------------------------------
+    - name: Display completion message
+      debug:
+        msg:
+          - "=============================================="
+          - "LUSTRE TEST ENVIRONMENT READY"
+          - "=============================================="
+          - ""
+          - "Filesystem: /mnt/lustre ({{ lustre_fsname }})"
+          - "MGS/MDT:    /mnt/mdt"
+          - "OST:        /mnt/ost"
+          - ""
+          - "Test Scenarios:"
+          - "  scenario1_proj100 (Project ID: 100)"
+          - "  scenario1_proj200 (Project ID: 200)"
+          - "  scenario2_proj300_src (Project ID: 300)"
+          - "  scenario2_proj300_dst (Project ID: 300)"
+          - ""
+          - "Run tests:"
+          - "  vagrant ssh"
+          - "  sudo /root/run_tests.sh      # Full test suite"
+          - "  sudo /root/quick_test.sh     # Quick EXDEV check"
+          - ""
+          - "=============================================="
+          

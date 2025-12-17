@@ -1,0 +1,161 @@
+---
+##################################################
+# PHASE 1: Install Lustre Kernel
+#
+# This phase installs the Lustre-patched Linux kernel
+# and configures GRUB to boot into it.
+#
+# Run automatically via: vagrant up
+# After completion, Vagrant will auto-reload the VM
+##################################################
+- name: Install Lustre Kernel and Prepare for Reboot
+  hosts: all
+  become: true
+  vars:
+    lustre_version: "2.16.0"
+    lustre_base_url: "https://downloads.whamcloud.com/public/lustre/lustre-{{ lustre_version }}/el9.4"
+
+  tasks:
+    # --------------------------------------------------
+    # System Preparation
+    # --------------------------------------------------
+    - name: Disable SELinux permanently (required for Lustre)
+      selinux:
+        state: disabled
+
+    - name: Disable firewall for test environment
+      systemd:
+        name: firewalld
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Enable CRB (CodeReady Builder) repository for dependencies
+      command: dnf config-manager --set-enabled crb
+      changed_when: false
+
+    - name: Install EPEL repository
+      dnf:
+        name: epel-release
+        state: present
+
+    - name: Generate hostid for ZFS compatibility
+      shell: |
+        if [ ! -f /etc/hostid ]; then
+          printf '%08x' "$$" > /etc/hostid
+        fi
+      args:
+        creates: /etc/hostid
+
+    # --------------------------------------------------
+    # Lustre Repository Configuration
+    # --------------------------------------------------
+    - name: Add Lustre Server repository
+      yum_repository:
+        name: lustre-server
+        description: "Lustre {{ lustre_version }} Server"
+        baseurl: "{{ lustre_base_url }}/server/"
+        gpgcheck: no
+        enabled: yes
+
+    - name: Add Lustre Client repository
+      yum_repository:
+        name: lustre-client
+        description: "Lustre {{ lustre_version }} Client"
+        baseurl: "{{ lustre_base_url }}/client/"
+        gpgcheck: no
+        enabled: yes
+
+    # --------------------------------------------------
+    # Kernel Installation
+    # --------------------------------------------------
+    - name: Check if Lustre kernel is already installed
+      shell: rpm -qa | grep -q "kernel.*lustre"
+      register: lustre_kernel_check
+      failed_when: false
+      changed_when: false
+
+    - name: List available Lustre kernels (for debugging)
+      command: dnf list available kernel*lustre*
+      register: available_kernels
+      when: lustre_kernel_check.rc != 0
+      ignore_errors: true
+
+    - name: Display available kernels
+      debug:
+        msg: "{{ available_kernels.stdout_lines | default(['No kernels found']) }}"
+      when: lustre_kernel_check.rc != 0
+
+    - name: Install Lustre kernel and core modules
+      dnf:
+        name:
+          - kernel-5.14.0*lustre*
+          - kernel-devel-5.14.0*lustre*
+          - kernel-headers-5.14.0*lustre*
+          - kmod-lustre
+          - lustre
+        state: present
+        disable_gpg_check: yes
+      when: lustre_kernel_check.rc != 0
+      register: kernel_install
+
+    - name: Fail if kernel installation failed
+      fail:
+        msg: |
+          Lustre kernel installation failed. This may indicate:
+          - Network connectivity issues to downloads.whamcloud.com
+          - Repository structure has changed
+          - Package naming convention has changed
+          Check available packages: dnf list available kernel*lustre*
+      when:
+        - lustre_kernel_check.rc != 0
+        - kernel_install is failed
+
+    # --------------------------------------------------
+    # Bootloader Configuration
+    # --------------------------------------------------
+    - name: Find installed Lustre kernel
+      find:
+        paths: /boot
+        patterns: "vmlinuz*lustre*"
+      register: found_lustre_kernels
+
+    - name: Verify Lustre kernel was found
+      fail:
+        msg: "No Lustre kernel found in /boot. Installation may have failed."
+      when: found_lustre_kernels.matched == 0
+
+    - name: Display found Lustre kernels
+      debug:
+        msg: "Found Lustre kernels: {{ found_lustre_kernels.files | map(attribute='path') | list }}"
+
+    - name: Set Lustre kernel as default in GRUB
+      command: "grubby --set-default {{ found_lustre_kernels.files | map(attribute='path') | sort | last }}"
+      when: "'lustre' not in ansible_kernel"
+      register: grub_update
+
+    - name: Verify GRUB default kernel
+      command: grubby --default-kernel
+      register: default_kernel
+      changed_when: false
+
+    - name: Display GRUB configuration
+      debug:
+        msg:
+          - "Default kernel: {{ default_kernel.stdout }}"
+          - "Current kernel: {{ ansible_kernel }}"
+
+    # --------------------------------------------------
+    # Completion
+    # --------------------------------------------------
+    - name: Display Phase 1 completion message
+      debug:
+        msg:
+          - "=============================================="
+          - "PHASE 1 COMPLETE"
+          - "=============================================="
+          - "Lustre kernel installed: {{ found_lustre_kernels.files | map(attribute='path') | sort | last }}"
+          - ""
+          - "Vagrant will now automatically reboot the VM"
+          - "and begin Phase 2 (Lustre + ZFS configuration)."
+          - "=============================================="
