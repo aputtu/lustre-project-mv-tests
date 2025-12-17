@@ -66,6 +66,25 @@
         gpgcheck: no
         enabled: yes
 
+    - name: Add Whamcloud e2fsprogs repository (provides ldiskfsprogs)
+      yum_repository:
+        name: e2fsprogs-wc
+        description: "Whamcloud e2fsprogs (ldiskfsprogs)"
+        baseurl: "https://downloads.whamcloud.com/public/e2fsprogs/latest/el9/"
+        gpgcheck: no
+        enabled: yes
+
+    - name: Install Lustre-patched e2fsprogs (ldiskfsprogs)
+      dnf:
+        name:
+          - e2fsprogs
+          - e2fsprogs-libs
+          - libcom_err
+          - libss
+        state: latest
+        enablerepo: e2fsprogs-wc
+        allowerasing: yes
+
     # --------------------------------------------------
     # Kernel Installation
     # --------------------------------------------------
@@ -159,3 +178,4 @@
           - "Vagrant will now automatically reboot the VM"
           - "and begin Phase 2 (Lustre + ZFS configuration)."
           - "=============================================="
+
