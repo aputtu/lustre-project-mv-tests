@@ -38,7 +38,7 @@ The suite runs four isolated tests to compare performance:
 | --- | --- | --- | --- |
 | **Test 0** | File Move (Project 100 → 200) | Atomic Rename | Baseline Success |
 | **Test 1** | Directory Move (Project 100 → 200) | **EXDEV Error** | Copy+Delete Fallback |
-| **Test 2** | 500MB Move (Different Projects) | Copy + Delete | **Slow Path** (~100x slower) |
+| **Test 2** | 500MB Move (Different Projects) | Copy + Delete | **Slow Path** (~60-100x slower) |
 | **Test 3** | 500MB Move (Same Project) | Atomic Rename | **Fast Path** (Instant) |
 | **Test 4** | Workaround (Align ID first) | Atomic Rename | Fast Path Restored |
 
