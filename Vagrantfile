@@ -1,4 +1,4 @@
-# Vagrantfile for Lustre + ZFS Test Environment
+# Vagrantfile for Lustre + LDISKFS Test Environment
 #
 # This environment tests Lustre project quota behavior with mv operations.
 # It demonstrates that moving files between directories with different
@@ -27,13 +27,13 @@ Vagrant.configure("2") do |config|
   config.vm.box = "rockylinux/9"
   config.vm.hostname = "lustre-test"
 
-  # Hardware resources - Lustre + ZFS need substantial memory
+  # Hardware resources for Lustre testing
   config.vm.provider "virtualbox" do |vb|
-    vb.name = "lustre-zfs-test"
+    vb.name = "lustre-ldiskfs-test"
     vb.memory = "20480"
     vb.cpus = 10
     vb.customize ["modifyvm", :id, "--ioapic", "on"]
-    # Improve disk I/O for ZFS operations
+    # Improve disk I/O for Lustre operations
     vb.customize ["storagectl", :id, "--name", "SATA Controller", "--hostiocache", "on"]
   end
 
@@ -62,9 +62,10 @@ Vagrant.configure("2") do |config|
     puts "WARNING: vagrant-reload plugin missing. Manual 'vagrant reload' required after Phase 1."
   end
 
-  # === PHASE 2: Configure Lustre + ZFS ===
+  # === PHASE 2: Configure Lustre + LDISKFS ===
   config.vm.provision "lustre_config", type: "ansible_local" do |ansible|
     ansible.playbook = "/tmp/phase2_lustre.yml"
     ansible.provisioning_path = "/tmp"
   end
 end
+

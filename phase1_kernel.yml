@@ -39,7 +39,7 @@
         name: epel-release
         state: present
 
-    - name: Generate hostid for ZFS compatibility
+    - name: Generate hostid for Lustre compatibility
       shell: |
         if [ ! -f /etc/hostid ]; then
           printf '%08x' "$$" > /etc/hostid
@@ -176,6 +176,5 @@
           - "Lustre kernel installed: {{ found_lustre_kernels.files | map(attribute='path') | sort | last }}"
           - ""
           - "Vagrant will now automatically reboot the VM"
-          - "and begin Phase 2 (Lustre + ZFS configuration)."
+          - "and begin Phase 2 (Lustre LDISKFS configuration)."
           - "=============================================="
-
